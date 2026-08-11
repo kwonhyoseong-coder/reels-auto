@@ -4,7 +4,7 @@
 - https://www.mss.go.kr/rss/smba/board/310.do (사업공고)
 """
 import feedparser
-from ._http import HEADERS
+from ._http import HEADERS, get
 
 PRESS_URL = "https://www.mss.go.kr/rss/smba/board/86.do"
 BIZ_URL = "https://www.mss.go.kr/rss/smba/board/310.do"
@@ -13,7 +13,12 @@ BIZ_URL = "https://www.mss.go.kr/rss/smba/board/310.do"
 def fetch(limit: int = 10) -> list[dict]:
     out: list[dict] = []
     for feed_url, source_tag in [(PRESS_URL, "중소벤처기업부 보도자료"), (BIZ_URL, "중소벤처기업부 사업공고")]:
-        d = feedparser.parse(feed_url, request_headers=HEADERS)
+        r = get(feed_url, want_xml=True)
+        if r is None:
+            print(f"  ⚠ {feed_url} 가져오기 실패")
+            continue
+        r.encoding = "utf-8"
+        d = feedparser.parse(r.text)
         for e in d.entries[:limit]:
             title = (e.get("title") or "").strip()
             link = (e.get("link") or "").strip()
