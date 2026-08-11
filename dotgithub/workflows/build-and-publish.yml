@@ -1,0 +1,152 @@
+# 완전 무료 자동 릴스 파이프라인
+# - 매일 06:00 / 12:00 / 18:00 KST 실행
+# - 정부 사이트 크롤링 → Gemini 대본 → TTS/영상 렌더 → Release 업로드 → Make Webhook
+# - public repo의 GitHub Actions는 무제한 무료
+name: Build and publish reel
+
+on:
+  schedule:
+    - cron: "0 21,3,9 * * *"   # 21/03/09 UTC = 06/12/18 KST
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (webhook/release 업로드 안 함)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reel-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-nanum
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build feed (crawl)
+        env:
+          PYTHONPATH: src
+        run: python src/build_feed.py --per-source 15
+
+      - name: Produce reel
+        id: produce
+        env:
+          PYTHONPATH: src
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: "gemini-2.0-flash"
+        run: |
+          echo "=== output 디렉토리 before ==="
+          ls -la output/ || true
+          echo "=== 피드 통과 기사 수 ==="
+          python -c "import json; d=json.load(open('output/policy-feed.json',encoding='utf-8')); print(len(d), '건'); [print(' -', x['source'], x['title'][:60]) for x in d[:10]]" || true
+          echo "=== produce_reel 실행 ==="
+          python src/produce_reel.py || echo "produce_reel 종료 코드 $?"
+          echo "=== output 디렉토리 after ==="
+          ls -la output/
+          MP4=$(ls -t output/reel_*.mp4 2>/dev/null | head -1 || true)
+          META="${MP4%.mp4}.json"
+          if [ -z "$MP4" ] || [ ! -f "$MP4" ]; then
+            echo "mp4=" >> "$GITHUB_OUTPUT"
+            echo "meta=" >> "$GITHUB_OUTPUT"
+            echo "새로 만들 영상이 없습니다."
+            exit 0
+          fi
+          echo "mp4=$MP4" >> "$GITHUB_OUTPUT"
+          echo "meta=$META" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to GitHub Release
+        id: release
+        if: steps.produce.outputs.mp4 != '' && github.event.inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MP4: ${{ steps.produce.outputs.mp4 }}
+          TAG: reel-${{ github.run_id }}
+        run: |
+          set -e
+          gh release create "$TAG" "$MP4" \
+            --title "Reel $TAG" \
+            --notes "Auto-generated reel" \
+            --target "$GITHUB_SHA"
+          # release asset 공개 URL
+          URL=$(gh release view "$TAG" --json assets -q '.assets[0].url' | sed 's|/api\.|/|; s|repos/||; s|releases/assets|releases/download|')
+          # 보다 안정적인 다운로드 URL 직접 조합
+          ASSET_NAME=$(basename "$MP4")
+          DL_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$ASSET_NAME"
+          echo "video_url=$DL_URL" >> "$GITHUB_OUTPUT"
+          echo "$DL_URL"
+
+      - name: Commit state & feed
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # output 디렉토리 전체를 추가 (state.json 없어도 실패하지 않음)
+          git add output/ || true
+          # 빈 디렉토리 .gitkeep 유지
+          if [ ! -f output/.gitkeep ]; then
+            touch output/.gitkeep
+            git add output/.gitkeep
+          fi
+          if git diff --cached --quiet; then
+            echo "변경사항 없음"
+          else
+            git commit -m "chore: refresh feed & state $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git pull --rebase origin "$GITHUB_REF_NAME" || true
+            git push
+          fi
+
+      - name: Notify Make webhook
+        if: steps.release.outputs.video_url != ''
+        env:
+          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
+          VIDEO_URL: ${{ steps.release.outputs.video_url }}
+          META_FILE: ${{ steps.produce.outputs.meta }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -e
+          if [ -z "$MAKE_WEBHOOK_URL" ]; then
+            echo "MAKE_WEBHOOK_URL 시크릿이 없어 webhook 전송 생략"
+            exit 0
+          fi
+          python - <<'PY'
+          import json, os, urllib.request
+          meta = json.load(open(os.environ["META_FILE"], encoding="utf-8"))
+          payload = {
+              "video_url": os.environ["VIDEO_URL"],
+              "caption": meta.get("caption", ""),
+              "title": meta.get("title", ""),
+              "source": meta.get("source", ""),
+              "article_url": meta.get("url", ""),
+              "run_id": os.environ["GITHUB_RUN_ID"],
+          }
+          data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+          req = urllib.request.Request(
+              os.environ["MAKE_WEBHOOK_URL"],
+              data=data,
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(req, timeout=30) as r:
+              print("webhook 응답:", r.status)
+              print(r.read().decode("utf-8")[:500])
+          PY
