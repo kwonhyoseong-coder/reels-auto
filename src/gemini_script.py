@@ -1,6 +1,6 @@
 """
 Gemini API로 릴스 대본 생성 (무료 티어).
-- 모델: gemini-2.0-flash (Free 1,500 RPD, 신용카드 불필요)
+- 모델: gemini-2.5-flash (Free tier, 신용카드 불필요)
 - API 키: https://aistudio.google.com/apikey
 - 반환: script dict (hook, body[], cta, hashtags[], source_label, source_url)
 """
@@ -13,7 +13,7 @@ from pathlib import Path
 import requests
 
 API_KEY = os.getenv("GEMINI_API_KEY", "")
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 API_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
 )
