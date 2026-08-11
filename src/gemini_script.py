@@ -1,6 +1,8 @@
 """
 Gemini API로 릴스 대본 생성 (무료 티어).
-- 모델: gemini-2.5-flash (Free tier, 신용카드 불필요)
+
+Google은 모델 이름을 자주 바꾸고 신규 계정은 구 모델을 막기 때문에,
+사용 가능한 모델 목록을 조회해서 가장 최신 Flash 계열 모델을 자동 선택한다.
 - API 키: https://aistudio.google.com/apikey
 - 반환: script dict (hook, body[], cta, hashtags[], source_label, source_url)
 """
@@ -13,10 +15,9 @@ from pathlib import Path
 import requests
 
 API_KEY = os.getenv("GEMINI_API_KEY", "")
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-API_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
-)
+# 강제로 특정 모델을 쓰고 싶으면 환경변수로 지정. 없으면 자동 탐색.
+FORCED_MODEL = os.getenv("GEMINI_MODEL", "")
+API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 SYSTEM_PROMPT = """\
 너는 대한민국 정부 정책·혜택 정보를 쉽게 설명하는 인스타 릴스 작가다.
@@ -39,9 +40,67 @@ JSON 스키마:
 """
 
 
+def pick_model() -> str:
+    """사용 가능한 가장 좋은 Flash 모델 자동 선택."""
+    if FORCED_MODEL:
+        return FORCED_MODEL
+
+    if not API_KEY:
+        raise RuntimeError("GEMINI_API_KEY 환경변수가 설정되지 않았습니다.")
+
+    r = requests.get(
+        f"{API_BASE}/models",
+        headers={"x-goog-api-key": API_KEY},
+        timeout=15,
+    )
+    r.raise_for_status()
+    models = [m["name"].replace("models/", "") for m in r.json().get("models", [])]
+
+    # 선호 순서: 신규 Flash preview > Flash-Lite > 2.5 Flash
+    preferences = [
+        "gemini-3.5-flash",
+        "gemini-3.1-flash-live",
+        "gemini-3.1-flash-lite",
+        "gemini-3-flash",
+        "gemini-2.5-flash",
+        "gemini-flash",
+    ]
+    # 지원되는 generateContent 메서드만 필터
+    generate_models = []
+    for m in r.json().get("models", []):
+        methods = m.get("supportedGenerationMethods", [])
+        if "generateContent" in methods:
+            generate_models.append(m["name"].replace("models/", ""))
+
+    # 버전 높은 순 정렬을 위해 이름에 'preview'/'exp' 붙은 건 우선
+    def rank(name: str) -> tuple:
+        score = 0
+        for i, pref in enumerate(preferences):
+            if pref in name:
+                score = 100 - i
+                break
+        if "flash" in name.lower():
+            score += 5
+        if "lite" in name.lower():
+            score -= 2
+        if "preview" in name.lower():
+            score += 1
+        return (score, name)
+
+    generate_models.sort(key=rank, reverse=True)
+    if not generate_models:
+        raise RuntimeError(f"사용 가능한 Gemini 모델이 없습니다. 전체 목록: {models}")
+    chosen = generate_models[0]
+    print(f"   → 자동 선택된 Gemini 모델: {chosen}", file=sys.stderr)
+    return chosen
+
+
 def generate_script(article: dict) -> dict:
     if not API_KEY:
         raise RuntimeError("GEMINI_API_KEY 환경변수가 설정되지 않았습니다.")
+
+    model = pick_model()
+    url = f"{API_BASE}/models/{model}:generateContent"
 
     user_prompt = f"""\
 아래 정부 보도자료를 25~35초 인스타 릴스 대본으로 만들어줘.
@@ -66,7 +125,7 @@ def generate_script(article: dict) -> dict:
         },
     }
     r = requests.post(
-        API_URL,
+        url,
         headers={"x-goog-api-key": API_KEY, "Content-Type": "application/json"},
         json=body,
         timeout=60,
@@ -75,7 +134,6 @@ def generate_script(article: dict) -> dict:
         raise RuntimeError(f"Gemini API {r.status_code}: {r.text[:500]}")
     data = r.json()
     text = data["candidates"][0]["content"]["parts"][0]["text"]
-    # 간혹 마크다운 코드블럭으로 감싸는 경우 대비
     text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M)
     script = json.loads(text)
     script["source_url"] = article["url"]
