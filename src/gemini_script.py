@@ -41,7 +41,11 @@ JSON 스키마:
 
 
 def pick_model() -> str:
-    """사용 가능한 가장 좋은 Flash 모델 자동 선택."""
+    """
+    사용 가능한 가장 좋은 Flash 모델 자동 선택.
+    모델 목록을 받아온 뒤, 실제로 generateContent를 호출해보고
+    404/400이 아닌 첫 모델을 쓴다. (신규 키는 2.5-flash를 막아서)
+    """
     if FORCED_MODEL:
         return FORCED_MODEL
 
@@ -54,45 +58,70 @@ def pick_model() -> str:
         timeout=15,
     )
     r.raise_for_status()
-    models = [m["name"].replace("models/", "") for m in r.json().get("models", [])]
+    data = r.json()
 
-    # 선호 순서: 신규 Flash preview > Flash-Lite > 2.5 Flash
-    preferences = [
-        "gemini-3.5-flash",
-        "gemini-3.1-flash-live",
-        "gemini-3.1-flash-lite",
-        "gemini-3-flash",
-        "gemini-2.5-flash",
-        "gemini-flash",
-    ]
-    # 지원되는 generateContent 메서드만 필터
-    generate_models = []
-    for m in r.json().get("models", []):
+    candidates = []
+    for m in data.get("models", []):
+        name = m["name"].replace("models/", "")
         methods = m.get("supportedGenerationMethods", [])
-        if "generateContent" in methods:
-            generate_models.append(m["name"].replace("models/", ""))
+        if "generateContent" not in methods:
+            continue
+        if "flash" not in name.lower():
+            continue
+        # 이미지/라이브/오디오 전용 모델 제외
+        if any(x in name.lower() for x in ["image", "live", "tts", "audio", "embedding"]):
+            continue
+        candidates.append(name)
 
-    # 버전 높은 순 정렬을 위해 이름에 'preview'/'exp' 붙은 건 우선
-    def rank(name: str) -> tuple:
+    # 선호도 순으로 정렬:
+    # 1) 3.x flash (preview) — 신규 키에 가장 확실하게 열려있음
+    # 2) 2.5-flash-lite
+    # 3) 2.5-flash (신규 키는 막혀있을 수 있음)
+    # 4) 2.0-flash
+    def sort_key(n: str) -> tuple:
         score = 0
-        for i, pref in enumerate(preferences):
-            if pref in name:
-                score = 100 - i
-                break
-        if "flash" in name.lower():
-            score += 5
-        if "lite" in name.lower():
-            score -= 2
-        if "preview" in name.lower():
-            score += 1
-        return (score, name)
+        low = n.lower()
+        if low.startswith("gemini-3"):
+            score += 100
+        elif "2.5" in low:
+            score += 50
+        elif "2.0" in low:
+            score += 30
+        if "lite" in low:
+            score -= 5  # 일단 flash 우선
+        if "preview" in low:
+            score += 2
+        return (score, n)
 
-    generate_models.sort(key=rank, reverse=True)
-    if not generate_models:
-        raise RuntimeError(f"사용 가능한 Gemini 모델이 없습니다. 전체 목록: {models}")
-    chosen = generate_models[0]
-    print(f"   → 자동 선택된 Gemini 모델: {chosen}", file=sys.stderr)
-    return chosen
+    candidates.sort(key=sort_key, reverse=True)
+    if not candidates:
+        raise RuntimeError("사용 가능한 Flash 모델이 없습니다.")
+
+    # 실제 호출 테스트: 1토큰만 요청해서 404/400이면 다음 모델로
+    probe = {
+        "contents": [{"role": "user", "parts": [{"text": "OK"}]}],
+        "generationConfig": {"maxOutputTokens": 1},
+    }
+    for m in candidates:
+        try:
+            tr = requests.post(
+                f"{API_BASE}/models/{m}:generateContent",
+                headers={"x-goog-api-key": API_KEY,
+                         "Content-Type": "application/json"},
+                json=probe,
+                timeout=15,
+            )
+            if tr.status_code == 200:
+                print(f"   → 자동 선택된 Gemini 모델: {m}", file=sys.stderr)
+                return m
+            else:
+                print(f"   ⚠ {m}: {tr.status_code} {tr.text[:120]}", file=sys.stderr)
+        except requests.RequestException as e:
+            print(f"   ⚠ {m}: {str(e)[:100]}", file=sys.stderr)
+
+    raise RuntimeError(
+        f"사용 가능한 Gemini Flash 모델을 찾지 못했습니다. 후보: {candidates}"
+    )
 
 
 def generate_script(article: dict) -> dict:
