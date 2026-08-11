@@ -53,7 +53,7 @@ jobs:
         env:
           PYTHONPATH: src
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: "gemini-2.0-flash"
+          GEMINI_MODEL: "gemini-2.5-flash"
         run: |
           echo "=== output 디렉토리 before ==="
           ls -la output/ || true
