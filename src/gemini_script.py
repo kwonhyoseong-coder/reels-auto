@@ -43,21 +43,20 @@ JSON 스키마:
 def pick_model() -> str:
     """
     안정적인 최신 Flash 모델을 확정적으로 사용.
-    1) GEMINI_MODEL 환경변수가 있으면 그걸 씀
-    2) 없으면 3.6-flash → 3.5-flash → 3-flash 순으로 실제 호출 테스트
+    - GEMINI_MODEL 환경변수가 있고 실제 호출이 되면 그걸 쓰고
+    - 실패하면(404 등) 자동으로 3.6-flash → 3.5-flash → 3-flash로 폴백
     """
-    if FORCED_MODEL:
-        return FORCED_MODEL
-
-    if not API_KEY:
-        raise RuntimeError("GEMINI_API_KEY 환경변수가 설정되지 않았습니다.")
-
     # 2026년 8월 현재 GA된 안정 Flash 모델들 (신규 키 허용)
     candidates = [
         "gemini-3.6-flash",
         "gemini-3.5-flash",
         "gemini-3-flash",
     ]
+    if FORCED_MODEL and FORCED_MODEL not in candidates:
+        candidates.insert(0, FORCED_MODEL)
+
+    if not API_KEY:
+        raise RuntimeError("GEMINI_API_KEY 환경변수가 설정되지 않았습니다.")
 
     probe = {
         "contents": [{"role": "user", "parts": [{"text": "OK"}]}],
