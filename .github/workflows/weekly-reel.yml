@@ -1,0 +1,95 @@
+# 매주 일요일 18:00 KST — 주간 베스트 혜택 요약 릴스
+name: Weekly best reel
+
+on:
+  schedule:
+    - cron: "0 9 * * 0"   # 매주 일요일 09:00 UTC = 18:00 KST
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reel-weekly
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-nanum
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Build feed first
+        env:
+          PYTHONPATH: src
+          GAS_PROXY_URL: ${{ secrets.GAS_PROXY_URL }}
+        run: python src/build_feed.py --per-source 20
+      - name: Build weekly reel
+        id: produce
+        env:
+          PYTHONPATH: src
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GAS_PROXY_URL: ${{ secrets.GAS_PROXY_URL }}
+        run: |
+          python src/weekly_reel.py
+          MP4=$(ls -t output/weekly_*.mp4 | head -1)
+          echo "mp4=$MP4" >> "$GITHUB_OUTPUT"
+      - name: Upload to GitHub Release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MP4: ${{ steps.produce.outputs.mp4 }}
+          TAG: weekly-${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [ -z "$MP4" ] && exit 0
+          ASSET_NAME=$(basename "$MP4")
+          CREATE_RESP=$(curl -sS -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/releases" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"Weekly Reel $TAG\",\"body\":\"주간 요약 릴스\"}")
+          RELEASE_ID=$(echo "$CREATE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+          UPLOAD_URL=$(echo "$CREATE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin)["upload_url"])')
+          UPLOAD_URL="${UPLOAD_URL%%\{*}"
+          curl -sS -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Content-Type: video/mp4" \
+            --data-binary @"$MP4" \
+            "$UPLOAD_URL?name=$ASSET_NAME" > /tmp/resp.json
+          DL_URL=$(python3 -c 'import json; print(json.load(open("/tmp/resp.json"))["browser_download_url"])')
+          echo "video_url=$DL_URL" >> "$GITHUB_OUTPUT"
+          echo "✅ $DL_URL"
+      - name: Commit state & feed
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add output/policy-feed.xml output/policy-feed.json output/.gitkeep 2>/dev/null || true
+          if git diff --cached --quiet; then echo "no change"; else
+            git commit -m "chore: weekly feed refresh"
+            git pull --rebase origin main || true
+            git push
+          fi
+      - name: Notify Make webhook
+        if: steps.release.outputs.video_url != ''
+        env:
+          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
+          VIDEO_URL: ${{ steps.release.outputs.video_url }}
+        run: |
+          [ -z "$MAKE_WEBHOOK_URL" ] && exit 0
+          curl -sS -X POST "$MAKE_WEBHOOK_URL" -H "Content-Type: application/json" \
+            --data "{\"video_url\":\"$VIDEO_URL\",\"caption\":\"이번 주 베스트 혜택 요약\",\"title\":\"주간 베스트\",\"source\":\"weekly\"}"
