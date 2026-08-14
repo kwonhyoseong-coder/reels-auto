@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from build_feed import build as build_feed, keyword_filter
 from gemini_script import generate_script, full_narration
 from render import render_reel
+from hashtags import hashtags_for, guess_category
 
 OUT = ROOT / "output"
 OUT.mkdir(exist_ok=True)
@@ -217,7 +218,12 @@ def run():
 
 
 def build_caption(script: dict, article: dict) -> str:
-    tags = " ".join(script.get("hashtags", []))
+    # 카테고리 감지 후 해시태그 자동 보강
+    category = article.get("category") or guess_category(
+        script.get("hook", "") + " ".join(script.get("body", []))
+    )
+    tags = hashtags_for(category, script.get("hashtags", []))
+    tags = " ".join(dict.fromkeys(tags))  # 중복 제거
     body = "\n".join(f"• {b}" for b in script["body"])
     return (
         f"{script['hook']}\n\n"
@@ -225,8 +231,7 @@ def build_caption(script: dict, article: dict) -> str:
         f"{script['cta']}\n\n"
         f"🔗 원문: {article['url']}\n"
         f"📌 출처: {article['source']} ({article.get('published','')})\n\n"
-        f"{tags}\n"
-        f"#정부혜택 #꿀정보 #릴스"
+        f"{tags}"
     )
 
 

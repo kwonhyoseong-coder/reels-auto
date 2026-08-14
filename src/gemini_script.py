@@ -47,17 +47,50 @@ JSON 스키마:
 """
 
 
+def _call_gemini(model: str, body: dict, *, attempts: int = 3) -> dict:
+    """Gemini API 호출. 500/503/429는 지수 백오프로 재시도."""
+    import time as _time
+    url = f"{API_BASE}/models/{model}:generateContent"
+    last_err = None
+    for i in range(attempts):
+        try:
+            r = requests.post(
+                url,
+                headers={"x-goog-api-key": API_KEY,
+                         "Content-Type": "application/json"},
+                json=body,
+                timeout=90,
+            )
+        except requests.RequestException as e:
+            last_err = f"network: {e}"
+            _time.sleep(2 ** i)
+            continue
+        if r.status_code == 200:
+            return r.json()
+        # 500/503/429는 재시도
+        if r.status_code in (429, 500, 503, 504):
+            print(f"   ⚠ {model}: HTTP {r.status_code}, {2**(i+1)}초 후 재시도...",
+                  file=sys.stderr)
+            _time.sleep(2 ** (i + 1))
+            last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+            continue
+        # 400/404 등은 바로 예외
+        raise RuntimeError(f"Gemini API {r.status_code}: {r.text[:500]}")
+    raise RuntimeError(f"Gemini 재시도 초과 ({model}): {last_err}")
+
+
 def pick_model() -> str:
     """
     안정적인 최신 Flash 모델을 확정적으로 사용.
-    - GEMINI_MODEL 환경변수가 있고 실제 호출이 되면 그걸 쓰고
-    - 실패하면(404 등) 자동으로 3.6-flash → 3.5-flash → 3-flash로 폴백
+    - GEMINI_MODEL 환경변수가 있으면 그걸 첫 후보로
+    - 실제 호출 테스트 후 살아있는 모델 반환
     """
-    # 2026년 8월 현재 GA된 안정 Flash 모델들 (신규 키 허용)
     candidates = [
         "gemini-3.6-flash",
         "gemini-3.5-flash",
         "gemini-3-flash",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
     ]
     if FORCED_MODEL and FORCED_MODEL not in candidates:
         candidates.insert(0, FORCED_MODEL)
@@ -71,23 +104,15 @@ def pick_model() -> str:
     }
     for m in candidates:
         try:
-            tr = requests.post(
-                f"{API_BASE}/models/{m}:generateContent",
-                headers={"x-goog-api-key": API_KEY,
-                         "Content-Type": "application/json"},
-                json=probe,
-                timeout=15,
-            )
-            if tr.status_code == 200:
+            data = _call_gemini(m, probe, attempts=1)
+            if data.get("candidates"):
                 print(f"   → Gemini 모델: {m}", file=sys.stderr)
                 return m
-            print(f"   ⚠ {m}: {tr.status_code} {tr.text[:150]}", file=sys.stderr)
-        except requests.RequestException as e:
-            print(f"   ⚠ {m}: {str(e)[:100]}", file=sys.stderr)
+        except Exception as e:
+            print(f"   ⚠ {m}: {str(e)[:120]}", file=sys.stderr)
 
     raise RuntimeError(
-        f"사용 가능한 Gemini 모델을 찾지 못했습니다. 시도: {candidates}. "
-        f"API 키와 https://aistudio.google.com/apikey 에서 모델 가용성을 확인하세요."
+        f"사용 가능한 Gemini 모델을 찾지 못했습니다. 시도: {candidates}."
     )
 
 
@@ -95,10 +120,58 @@ def generate_script(article: dict) -> dict:
     if not API_KEY:
         raise RuntimeError("GEMINI_API_KEY 환경변수가 설정되지 않았습니다.")
 
-    model = pick_model()
-    url = f"{API_BASE}/models/{model}:generateContent"
+    # 모델 후보 순서대로 시도 (503이면 다음 모델로)
+    model_order = [
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3-flash",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+    ]
+    if FORCED_MODEL:
+        model_order.insert(0, FORCED_MODEL)
 
-    user_prompt = f"""\
+    user_prompt = _build_prompt(article)
+    body = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": {
+            "temperature": 0.4,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    last_err = None
+    for model in model_order:
+        try:
+            data = _call_gemini(model, body, attempts=3)
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M)
+            script = json.loads(text)
+            script["source_url"] = article["url"]
+            script["article_title"] = article["title"]
+            script["source"] = article.get("source", "")
+            print(f"   → 사용 모델: {model}", file=sys.stderr)
+            return script
+        except Exception as e:
+            msg = str(e)
+            # 404 (no longer available)는 다음 모델로
+            if "404" in msg or "no longer" in msg.lower():
+                print(f"   ⚠ {model} 사용 불가, 다음 모델로", file=sys.stderr)
+                last_err = e
+                continue
+            # 503은 재시도했는데도 실패면 다음 모델
+            if "503" in msg or "재시도 초과" in msg:
+                print(f"   ⚠ {model} 과부하, 다음 모델로", file=sys.stderr)
+                last_err = e
+                continue
+            # 그 외 에러는 그대로 던지기
+            raise
+    raise RuntimeError(f"모든 Gemini 모델 실패. 마지막 에러: {last_err}")
+
+
+def _build_prompt(article: dict) -> str:
+    return f"""\
 아래 정부 보도자료를 25~35초 인스타 릴스 대본으로 만들어줘.
 
 [원칙]
@@ -118,31 +191,6 @@ JSON으로만 답할 것. 필드: hook, body[3], cta, hashtags[4], source_label.
 [원문]
 {article.get('content') or article.get('summary','')[:2000]}
 """
-
-    body = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "generationConfig": {
-            "temperature": 0.4,
-            "responseMimeType": "application/json",
-        },
-    }
-    r = requests.post(
-        url,
-        headers={"x-goog-api-key": API_KEY, "Content-Type": "application/json"},
-        json=body,
-        timeout=60,
-    )
-    if r.status_code != 200:
-        raise RuntimeError(f"Gemini API {r.status_code}: {r.text[:500]}")
-    data = r.json()
-    text = data["candidates"][0]["content"]["parts"][0]["text"]
-    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M)
-    script = json.loads(text)
-    script["source_url"] = article["url"]
-    script["article_title"] = article["title"]
-    script["source"] = article.get("source", "")
-    return script
 
 
 def full_narration(script: dict) -> str:
