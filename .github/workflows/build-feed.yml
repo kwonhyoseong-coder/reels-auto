@@ -1,0 +1,56 @@
+name: Build policy RSS feed
+
+# 매일 06:00, 12:00, 18:00 KST (UTC 기준 21:00 / 03:00 / 09:00)에 실행
+on:
+  schedule:
+    - cron: "0 21,3,9 * * *"
+  workflow_dispatch:  # GitHub UI에서 수동 실행 버튼
+  push:
+    branches: [ main ]
+    paths:
+      - "src/**"
+      - ".github/workflows/**"
+
+permissions:
+  contents: write  # 결과물을 리포지토리에 커밋하기 위함
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libxml2-dev libxslt1-dev
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install feedparser requests beautifulsoup4 lxml feedgen python-dotenv
+
+      - name: Run crawler
+        env:
+          PYTHONPATH: src
+        run: |
+          python src/build_feed.py --per-source 15
+
+      - name: Commit feed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/policy-feed.xml output/policy-feed.json
+          if git diff --cached --quiet; then
+            echo "변경사항 없음 - 커밋 스킵"
+          else
+            git commit -m "chore: refresh policy feed $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
