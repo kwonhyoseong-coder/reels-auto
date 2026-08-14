@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -43,16 +44,97 @@ def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def pick_article(articles: list[dict], state: dict) -> dict | None:
-    """키워드 필터 통과 + 아직 안 만든 것 중 최신 1건."""
+def score_article(a: dict) -> int:
+    """릴스로 만들 가치가 높을수록 높은 점수.
+    핵심: '시청자(국민)에게 직접 돈/서비스/권리로 돌아오는가'"""
+    title = a.get("title", "")
+    body = (a.get("summary", "") or "") + " " + (a.get("content", "") or "")
+    head = title + " " + body[:600]
+    score = 0
+
+    # ✓ 시민이 직접 받는 혜택·서비스
+    citizen_benefits = [
+        "지원금", "보조금", "장려금", "수당", "급여", "연금", "환급",
+        "감면", "면제", "할인", "무료", "지원대상", "신청하세요", "신청방법",
+        "신청기간", "자격요건", "신청접수", "모집공고", "대상자",
+        "확대 지원", "최대", "지급", "인상", "도입", "지원",
+        "육아휴직", "부모급여", "아동수당", "기초생활", "청년도약",
+    ]
+    for k in citizen_benefits:
+        if k in title:
+            score += 25
+        elif k in head:
+            score += 8
+
+    # ✓ 구체적 숫자/금액
+    if re.search(r"\d{1,4}(?:,\d{3})*(?:\s*(?:만원|억원|천만원|원))", body):
+        score += 20
+    if re.search(r"\d+(?:\.\d+)?%", body):
+        score += 10
+    if re.search(r"\d{1,2}\.\d{1,2}", title):
+        score += 5
+
+    # ✓ 날짜/마감 정보
+    if re.search(r"\d{1,2}월\s*\d{1,2}일", body) or "부터" in head or "시행" in head:
+        score += 10
+    if "마감" in body or "까지" in body[:300]:
+        score += 10
+
+    # ✗ PR성/내부 활동/간담회는 강하게 감점
+    pr_keywords = [
+        "업무보고", "간담회", "업무협약", "MOU", "현장방문", "현장점검",
+        "첫 회의", "출범식", "워크숍", "세미나", "포럼", "축하", "격려",
+        "브리핑", "논의", "점검 회의", "진단 실시", "특별진단",
+        "개최", "주최", "기념식", "위원회 출범", "현장 간담",
+        "현장 점검", "현장챙", "지도·점검", "점검·", "점검 결과", "합동점검",
+        "현장 방문", "조직문화", "현장 행보", "현장간담", "현장방문",
+        "위원장", "위원회", "실시", "점검",
+    ]
+    for k in pr_keywords:
+        if k in title:
+            score -= 60
+        elif k in head[:300]:
+            score -= 20
+
+    # ✗ 사측/기업 대상(B2B) 뉴스는 일반 시청자 혜택 아님
+    b2b = ["대·중소기업", "납품대금", "상생협약", "가맹점", "프랜차이즈",
+           "수출기업", "중견기업", "대기업", "협력사", "대중소"]
+    for k in b2b:
+        if k in title:
+            score -= 15
+
+    # ✗ 추상적/관료적 표현
+    for k in ["발표했습니다", "계획입니다", "논의했습니다", "모색", "살펴보"]:
+        if k in body[:300]:
+            score -= 5
+
+    # 부처별 가중
+    if a.get("source") == "고용노동부":
+        score += 3
+    if a.get("source") == "보건복지부":
+        score += 3
+
+    # 본문이 너무 짧으면 정보 부족
+    if len(body) < 100:
+        score -= 10
+    return score
+
+
+def pick_article(articles: list[dict], state: dict) -> tuple[dict | None, list[dict]]:
+    """키워드 필터 통과 + 아직 안 만든 것 중 점수 높은 1건 반환.
+    디버그를 위해 상위 5개 점수도 같이 반환."""
     seen = set(state.get("published_ids", []))
+    candidates = []
     for a in articles:
         if a["id"] in seen:
             continue
         if not keyword_filter(a["title"], a.get("summary", "")):
             continue
-        return a
-    return None
+        s = score_article(a)
+        candidates.append((s, a))
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    top5 = [{"score": s, "source": a["source"], "title": a["title"]} for s, a in candidates[:5]]
+    return (candidates[0][1] if candidates else None), top5
 
 
 def run():
@@ -84,12 +166,15 @@ def run():
     _, articles = build_feed(per_source=int(os.getenv("PER_SOURCE", "15")))
 
     state = load_state()
-    article = pick_article(articles, state)
+    article, top5 = pick_article(articles, state)
     if not article:
         print("🟡 새로 만들 기사가 없습니다. 종료.")
         return
 
-    print(f"② 대상 선정: [{article['source']}] {article['title']}")
+    print("② 대상 선정 후보 (점수순):")
+    for t in top5:
+        print(f"   {t['score']:+4d}  [{t['source']}] {t['title'][:60]}")
+    print(f"   → 선택: [{article['source']}] {article['title']}")
 
     print("③ Gemini 대본 생성 중...")
     script = generate_script(article)
