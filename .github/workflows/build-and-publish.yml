@@ -48,6 +48,7 @@ jobs:
       - name: Build feed (crawl)
         env:
           PYTHONPATH: src
+          GAS_PROXY_URL: ${{ secrets.GAS_PROXY_URL }}
         run: python src/build_feed.py --per-source 15
 
       - name: Produce reel
@@ -55,6 +56,7 @@ jobs:
         env:
           PYTHONPATH: src
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GAS_PROXY_URL: ${{ secrets.GAS_PROXY_URL }}
         run: |
           set -x
           ls -la output/ || true
