@@ -63,7 +63,12 @@ jobs:
           echo "=== 피드 통과 기사 ==="
           python -c "import json; d=json.load(open('output/policy-feed.json',encoding='utf-8')); print(len(d),'건'); [print(' -',x['source'],x['title'][:60]) for x in d[:10]]" || true
           echo "=== produce_reel 실행 ==="
-          python src/produce_reel.py || echo "produce_reel 종료 코드 $?"
+          FORCE_FLAG=""
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            FORCE_FLAG="--force"
+            echo "⚡ force=true : 새 글이 없어도 최고점 기사로 재생성합니다."
+          fi
+          python src/produce_reel.py $FORCE_FLAG || echo "produce_reel 종료 코드 $?"
           echo "=== output after ==="
           ls -la output/
           MP4=$(ls -t output/reel_*.mp4 2>/dev/null | head -1 || true)
