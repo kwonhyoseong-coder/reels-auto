@@ -4,7 +4,8 @@
 - 본문: enewsView.do?news_seq=XXXX
 """
 import re
-from datetime import datetime
+
+from ._html import html_to_text
 from ._http import get
 
 BASE = "https://www.moel.go.kr"
@@ -19,9 +20,8 @@ def fetch(limit: int = 10) -> list[dict]:
     resp.encoding = "utf-8"
     html = resp.text
 
-    # 목록에서 news_seq + 제목 추출
     rows = re.findall(
-        r'enewsView\.do\?[^"\']*news_seq=(\d+)[^"\']*"[^>]*>([^<]+)<',
+        r"enewsView\.do\?[^\"']*news_seq=(\d+)[^\"']*\"[^>]*>([^<]+)<",
         html,
     )
     seen = set()
@@ -32,7 +32,7 @@ def fetch(limit: int = 10) -> list[dict]:
         seen.add(seq)
         title = title.strip()
         url = f"{VIEW_URL}?news_seq={seq}"
-        a = {
+        articles.append({
             "id": f"moel-{seq}",
             "title": title,
             "url": url,
@@ -41,50 +41,44 @@ def fetch(limit: int = 10) -> list[dict]:
             "published": "",
             "summary": "",
             "content": "",
-        }
-        articles.append(a)
+        })
         if len(articles) >= limit:
             break
 
-    # 최신 3건만 본문/날짜 enrichment (네트워크 부하 절약)
-    for a in articles[:3]:
-        _enrich(a)
+    for a in articles[: max(8, min(limit, 10))]:
+        enrich(a)
     return articles
 
 
-def _enrich(article: dict) -> None:
+def enrich(article: dict) -> None:
     r = get(article["url"])
     if r is None:
         return
     r.encoding = "utf-8"
     html = r.text
-    m = re.search(r'(\d{4}-\d{2}-\d{2})', html)
+    m = re.search(r"(20\d{2}-\d{2}-\d{2})", html)
     if m:
         article["published"] = m.group(1)
+
     content = ""
     m = re.search(
-        r'<div[^>]*class="[^"]*b_content[^"]*"[^>]*>(.*?)</div>\s*<div[^>]*class="[^"]*(?:related_detail|contents_util)',
-        html, re.S,
+        r'<div[^>]*class="[^"]*b_content[^"]*"[^>]*>(.*?)'
+        r'(?:<div[^>]*class="[^"]*(?:related_detail|contents_util|board_btns|synap_view))',
+        html, re.S | re.I,
     )
     if not m:
         m = re.search(
             r'<div[^>]*class="[^"]*b_content[^"]*"[^>]*>(.*?)</div>',
-            html, re.S,
+            html, re.S | re.I,
         )
     if m:
-        content = _strip_html(m.group(1))[:3000]
-    article["content"] = content.strip()
-    article["summary"] = content[:200].strip()
+        content = html_to_text(m.group(1))
+    if len(content) < 80:
+        return
 
-
-def _strip_html(s: str) -> str:
-    s = re.sub(r'<script.*?</script>', '', s, flags=re.S)
-    s = re.sub(r'<style.*?</style>', '', s, flags=re.S)
-    s = re.sub(r'<[^>]+>', ' ', s)
-    s = re.sub(r'&nbsp;', ' ', s)
-    s = re.sub(r'&[a-z]+;', '', s)
-    s = re.sub(r'\s+', ' ', s)
-    return s.strip()
+    article["content"] = content[:5000]
+    article["summary"] = content[:200]
+    print(f"    본문 {len(article['content'])}자  ← {article['title'][:36]}")
 
 
 def _category(title: str) -> str:
@@ -102,5 +96,4 @@ if __name__ == "__main__":
     for a in fetch(3):
         print(f"[{a['published']}] {a['title']}")
         print(f"  {a['url']}")
-        print(f"  {a['summary'][:120]}")
-        print()
+        print(f"  content={len(a.get('content') or '')}자")
