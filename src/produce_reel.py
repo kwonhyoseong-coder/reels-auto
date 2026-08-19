@@ -27,6 +27,7 @@ from gemini_script import generate_script, full_narration
 from render import render_reel
 from hashtags import hashtags_for, guess_category
 
+MIN_CONTENT = 80
 OUT = ROOT / "output"
 OUT.mkdir(exist_ok=True)
 STATE_FILE = OUT / "state.json"
@@ -117,25 +118,73 @@ def score_article(a: dict) -> int:
 
     # 본문이 너무 짧으면 정보 부족
     if len(body) < 100:
-        score -= 10
+        score -= 30
+    elif len(body) >= 400:
+        score += 12
     return score
 
 
-def pick_article(articles: list[dict], state: dict) -> tuple[dict | None, list[dict]]:
-    """키워드 필터 통과 + 아직 안 만든 것 중 점수 높은 1건 반환.
-    디버그를 위해 상위 5개 점수도 같이 반환."""
-    seen = set(state.get("published_ids", []))
-    candidates = []
+def _body_len(a: dict) -> int:
+    return len((a.get("content") or a.get("summary") or "").strip())
+
+
+def enrich_missing(articles: list[dict], limit: int = 10) -> None:
+    """본문이 비어 있는 기사만 상세 페이지에서 보강."""
+    from sources import mss, mohw, moel
+
+    enrichers = {
+        "중소벤처기업부": mss.enrich,
+        "보건복지부": mohw.enrich,
+        "고용노동부": moel.enrich,
+    }
+    n = 0
     for a in articles:
-        if a["id"] in seen:
+        if n >= limit:
+            break
+        if _body_len(a) >= MIN_CONTENT:
             continue
-        if not keyword_filter(a["title"], a.get("summary", "")):
+        fn = enrichers.get(a.get("source", ""))
+        if not fn:
+            continue
+        try:
+            fn(a)
+            n += 1
+        except Exception as e:
+            print(f"   ⚠ 본문 보강 실패 [{a.get('source')}] {e}")
+
+
+def pick_article(articles: list[dict], state: dict, force: bool = False
+                 ) -> tuple[dict | None, list[dict]]:
+    """키워드 필터 통과 + 아직 안 만든 것 중 점수 높은 1건.
+    force=True 이면 이미 만든 기사라도 최고점 1건을 다시 만든다."""
+    seen = set(state.get("published_ids", []))
+    unused, used, empty = [], [], []
+    for a in articles:
+        if not keyword_filter(a["title"], a.get("summary", "") + " " + a.get("content", "")):
+            continue
+        if _body_len(a) < MIN_CONTENT:
+            empty.append(a)
             continue
         s = score_article(a)
-        candidates.append((s, a))
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    top5 = [{"score": s, "source": a["source"], "title": a["title"]} for s, a in candidates[:5]]
-    return (candidates[0][1] if candidates else None), top5
+        (used if a["id"] in seen else unused).append((s, a))
+    unused.sort(key=lambda x: x[0], reverse=True)
+    used.sort(key=lambda x: x[0], reverse=True)
+
+    print(f"   미사용 {len(unused)}건 / 이미만듦 {len(used)}건 / 본문없음 {len(empty)}건 "
+          f"/ state {len(seen)}건")
+    if empty:
+        for a in empty[:5]:
+            print(f"      (본문없음) [{a['source']}] {a['title'][:50]}")
+
+    pool = unused if unused else (used if force else [])
+    if not pool:
+        return None, []
+    if not unused and force:
+        print("   ⚡ force: 새 글이 없어 이미 만든 기사 중 최고점으로 재생성합니다.")
+
+    top5 = [{"score": s, "source": a["source"], "title": a["title"],
+             "chars": _body_len(a)} for s, a in pool[:5]]
+    return pool[0][1], top5
 
 
 def run():
@@ -144,7 +193,11 @@ def run():
                         help="영상만 만들고 state 업데이트는 안 함")
     parser.add_argument("--test", action="store_true",
                         help="더미 대본으로 샘플 영상만 생성")
+    parser.add_argument("--force", action="store_true",
+                        help="새 글이 없어도 최고점 기사로 영상을 다시 만든다")
     args = parser.parse_args()
+    if os.getenv("FORCE", "").lower() in ("1", "true", "yes"):
+        args.force = True
 
     if args.test:
         sample = {
@@ -166,16 +219,21 @@ def run():
     print("① 피드 빌드 중...")
     _, articles = build_feed(per_source=int(os.getenv("PER_SOURCE", "15")))
 
+    print("   본문 없는 기사 보강 중...")
+    enrich_missing(articles, limit=12)
+
     state = load_state()
-    article, top5 = pick_article(articles, state)
+    article, top5 = pick_article(articles, state, force=args.force)
     if not article:
         print("🟡 새로 만들 기사가 없습니다. 종료.")
+        print("   → 이미 만든 기사만 있거나, 본문이 있는 혜택 기사가 없습니다.")
+        print("   → GitHub Actions에서 force=true 로 다시 실행하면 최고점 기사로 재생성합니다.")
         return
 
     print("② 대상 선정 후보 (점수순):")
     for t in top5:
-        print(f"   {t['score']:+4d}  [{t['source']}] {t['title'][:60]}")
-    print(f"   → 선택: [{article['source']}] {article['title']}")
+        print(f"   {t['score']:+4d}  [{t['source']}] {t['title'][:56]}  ({t.get('chars',0)}자)")
+    print(f"   → 선택: [{article['source']}] {article['title']}  (본문 {_body_len(article)}자)")
 
     print("③ Gemini 대본 생성 중...")
     script = generate_script(article)

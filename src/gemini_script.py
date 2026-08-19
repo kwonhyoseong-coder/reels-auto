@@ -117,17 +117,17 @@ def generate_script(article: dict) -> dict:
     }
 
     last_err = None
+    script = None
+    used_model = None
     for model in model_order:
         try:
             data = _call_gemini(model, body, attempts=3)
             text = data["candidates"][0]["content"]["parts"][0]["text"]
             text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M)
             script = json.loads(text)
-            script["source_url"] = article["url"]
-            script["article_title"] = article["title"]
-            script["source"] = article.get("source", "")
+            used_model = model
             print(f"   → 사용 모델: {model}", file=sys.stderr)
-            return script
+            break
         except Exception as e:
             msg = str(e)
             # 404 (no longer available)는 다음 모델로
@@ -142,7 +142,55 @@ def generate_script(article: dict) -> dict:
                 continue
             # 그 외 에러는 그대로 던지기
             raise
-    raise RuntimeError(f"모든 Gemini 모델 실패. 마지막 에러: {last_err}")
+    if script is None:
+        raise RuntimeError(f"모든 Gemini 모델 실패. 마지막 에러: {last_err}")
+
+    if _is_vague(script) and used_model:
+        print("   ⚠ 대본이 모호함 → 한 번 더 구체적으로 재작성", file=sys.stderr)
+        retry_body = {
+            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+            "contents": [{"role": "user", "parts": [{
+                "text": user_prompt + (
+                    "\n\n[재작성 지시] 방금 초안이 너무 모호했다. "
+                    "body 3문장에서 '알아보세요/확인하세요/자세한 내용은/누리집'을 "
+                    "전부 빼고, 원문에 있는 숫자·날짜·대상·금액을 문장마다 넣어라."
+                )
+            }]}],
+            "generationConfig": {
+                "temperature": 0.2,
+                "responseMimeType": "application/json",
+            },
+        }
+        try:
+            data = _call_gemini(used_model, retry_body, attempts=2)
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M)
+            script = json.loads(text)
+        except Exception as e:
+            print(f"   ⚠ 재작성 실패, 초안 유지: {e}", file=sys.stderr)
+
+    script["source_url"] = article["url"]
+    script["article_title"] = article["title"]
+    script["source"] = article.get("source", "")
+    if not isinstance(script.get("highlight"), list):
+        script["highlight"] = ["", "", ""]
+    while len(script["highlight"]) < 3:
+        script["highlight"].append("")
+    return script
+
+
+_VAGUE = ("알아보세요", "확인해 보세요", "확인해보세요", "자세한 내용은",
+          "누리집에서 확인", "계획을 확인")
+
+
+def _is_vague(script: dict) -> bool:
+    body = " ".join(script.get("body") or [])
+    if any(p in body for p in _VAGUE):
+        return True
+    # 숫자/날짜/금액이 본문 전체에 하나도 없으면 모호
+    if not re.search(r"\d", body):
+        return True
+    return False
 
 
 def _build_prompt(article: dict) -> str:
