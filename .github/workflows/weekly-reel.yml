@@ -84,12 +84,15 @@ jobs:
             git pull --rebase origin main || true
             git push
           fi
-      - name: Notify Make webhook
-        if: steps.release.outputs.video_url != ''
+      - name: Notify Telegram
+        if: steps.produce.outputs.mp4 != ''
         env:
-          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
-          VIDEO_URL: ${{ steps.release.outputs.video_url }}
+          PYTHONPATH: src
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          [ -z "$MAKE_WEBHOOK_URL" ] && exit 0
-          curl -sS -X POST "$MAKE_WEBHOOK_URL" -H "Content-Type: application/json" \
-            --data "{\"video_url\":\"$VIDEO_URL\",\"caption\":\"이번 주 베스트 혜택 요약\",\"title\":\"주간 베스트\",\"source\":\"weekly\"}"
+          META=$(ls -t output/weekly_*.json 2>/dev/null | head -1 || true)
+          python src/notify_telegram.py \
+            --mp4 "${{ steps.produce.outputs.mp4 }}" \
+            --meta "$META" \
+            --video-url "${{ steps.release.outputs.video_url }}"

@@ -134,7 +134,19 @@ jobs:
             git push
           fi
 
-      - name: Notify Make webhook
+      - name: Notify Telegram (반자동 게시)
+        if: ${{ always() && steps.produce.outputs.mp4 != '' && github.event.inputs.dry_run != 'true' }}
+        env:
+          PYTHONPATH: src
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python src/notify_telegram.py \
+            --mp4 "${{ steps.produce.outputs.mp4 }}" \
+            --meta "${{ steps.produce.outputs.meta }}" \
+            --video-url "${{ steps.release.outputs.video_url }}"
+
+      - name: Notify Make webhook (선택)
         if: steps.release.outputs.video_url != ''
         env:
           MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
@@ -143,7 +155,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           if [ -z "$MAKE_WEBHOOK_URL" ]; then
-            echo "MAKE_WEBHOOK_URL 시크릿 없음 — 웹훅 전송 생략"
+            echo "MAKE_WEBHOOK_URL 시크릿 없음 — 생략"
             exit 0
           fi
           python3 - <<'PY'
@@ -166,5 +178,4 @@ jobs:
           )
           with urllib.request.urlopen(req, timeout=30) as r:
               print("webhook 응답:", r.status)
-              print(r.read().decode("utf-8")[:500])
           PY
